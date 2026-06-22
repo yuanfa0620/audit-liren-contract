@@ -13,6 +13,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
 
     uint256 public constant TOTAL_SUPPLY = 1_000_000_000 * 10 ** 18;
     uint256 public constant WHALE_THRESHOLD = 670_000_000 * 10 ** 18;
+    uint256 public constant MIN_FIRST_TRANSFER = TOTAL_SUPPLY * 33 / 100;
     uint256 public constant PRICE_PRECISION = 1e18;
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
@@ -37,16 +38,21 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         uint256 lockPrice;
         uint256 requiredQuote;
         uint256 totalDeposited;
+        uint256 depositCompletedAt;
+        uint256 totalQuoteClaimed;
     }
 
     bool public frozen;
     bool public frozenPermanent;
     bool public whaleCheckEnabled;
     address public lastWhale;
+    address public quoteSweeper;
+    uint256 public quoteSweepDelay;
 
     IERC20 public immutable quoteToken;
 
     uint256 public incidentId;
+    bool private _firstTransferCompleted;
 
     mapping(address => bool) private _pairsEnabled;
     address[] private _pairs;
@@ -77,6 +83,8 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         uint256 artAmount,
         uint256 quoteAmount
     );
+    event QuoteSweeperUpdated(address indexed sweeper);
+    event RemainingQuoteSwept(uint256 indexed incidentId, address indexed to, uint256 amount);
 
     error TransferFrozen();
     error InvalidBeneficiary();
@@ -94,6 +102,13 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
     error FrozenConfigLocked();
     error DepositExceedsRequired();
     error InvalidQuoteToken();
+    error InsufficientBalance();
+    error FirstTransferTooSmall();
+    error FirstTransferTooLarge();
+    error UnauthorizedSweeper();
+    error SweepTooEarly();
+    error InvalidRecipient();
+    error NothingToSweep();
 
     constructor(
         string memory vaultFilesIpfsCID_,
@@ -138,7 +153,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         );
     }
 
-    function setPair(address pair, bool enabled) external onlyOwner {
+    function setPair(address pair, bool enabled, uint256 quoteSweepDelay_) external onlyOwner {
         if (frozenPermanent) revert FrozenConfigLocked();
 
         bool wasEnabled = _pairsEnabled[pair];
@@ -154,7 +169,14 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
             _pairsEnabled[pair] = false;
         }
 
+        quoteSweepDelay = quoteSweepDelay_;
+
         emit PairUpdated(pair, enabled);
+    }
+
+    function setQuoteSweeper(address sweeper_) external onlyOwner {
+        quoteSweeper = sweeper_;
+        emit QuoteSweeperUpdated(sweeper_);
     }
 
     function isPair(address pair) public view returns (bool) {
@@ -214,6 +236,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         }
 
         incident.totalDeposited += received;
+        _markDepositCompleted(incident);
 
         emit QuoteDeposited(incidentId_, msg.sender, received);
     }
@@ -236,6 +259,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         }
 
         incident.totalDeposited += received;
+        _markDepositCompleted(incident);
 
         emit QuoteDeposited(incidentId_, msg.sender, received);
     }
@@ -245,15 +269,17 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         if (incident.whale == address(0)) revert InvalidIncident();
         if (incident.lockPrice == 0) revert PriceNotSet();
         if (incident.totalDeposited < incident.requiredQuote) revert InsufficientWhaleDeposit();
-        if (!_canClaim(msg.sender, incident.whale)) revert NotClaimable();
+        if (!_canClaim(msg.sender)) revert NotClaimable();
         if (artAmount == 0) revert NotClaimable();
-        if (artAmount > unlockedBalance(msg.sender)) revert TransferExceedsUnlocked();
+        uint256 maxArt = _maxClaimableArt(msg.sender, incident);
+        if (artAmount > maxArt) revert InsufficientBalance();
 
         uint256 quoteOut = (artAmount * incident.lockPrice) / PRICE_PRECISION;
         if (quoteToken.balanceOf(address(this)) < quoteOut) revert InsufficientVaultBalance();
 
         _transfer(msg.sender, BURN_ADDRESS, artAmount);
         claimedArt[incidentId_][msg.sender] += artAmount;
+        incident.totalQuoteClaimed += quoteOut;
         quoteToken.safeTransfer(msg.sender, quoteOut);
 
         emit QuoteClaimed(incidentId_, msg.sender, artAmount, quoteOut);
@@ -267,12 +293,12 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         Incident storage incident = incidents[incidentId_];
         if (
             incident.lockPrice == 0 || incident.totalDeposited < incident.requiredQuote
-                || !_canClaim(user, incident.whale)
+                || !_canClaim(user)
         ) {
             return 0;
         }
 
-        uint256 maxArt = unlockedBalance(user);
+        uint256 maxArt = _maxClaimableArt(user, incident);
         if (maxArt == 0) {
             return 0;
         }
@@ -280,6 +306,25 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         uint256 quoteOut = (maxArt * incident.lockPrice) / PRICE_PRECISION;
         uint256 vaultBalance = quoteToken.balanceOf(address(this));
         return quoteOut > vaultBalance ? vaultBalance : quoteOut;
+    }
+
+    function sweepRemainingQuote(uint256 incidentId_, address to) external nonReentrant {
+        if (msg.sender != quoteSweeper) revert UnauthorizedSweeper();
+        if (to == address(0)) revert InvalidRecipient();
+
+        Incident storage incident = incidents[incidentId_];
+        if (incident.whale == address(0)) revert InvalidIncident();
+        if (incident.depositCompletedAt == 0) revert NotClaimable();
+        if (block.timestamp < incident.depositCompletedAt + quoteSweepDelay) revert SweepTooEarly();
+
+        uint256 vaultBalance = quoteToken.balanceOf(address(this));
+        uint256 earmarked = incident.totalDeposited - incident.totalQuoteClaimed;
+        uint256 amount = vaultBalance < earmarked ? vaultBalance : earmarked;
+        if (amount == 0) revert NothingToSweep();
+
+        quoteToken.safeTransfer(to, amount);
+
+        emit RemainingQuoteSwept(incidentId_, to, amount);
     }
 
     function vestingScheduleCount(address beneficiary) external view returns (uint256) {
@@ -390,8 +435,15 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
             }
         }
 
+        if (!_firstTransferCompleted && from != address(0) && from != address(this)) {
+            if (value <= MIN_FIRST_TRANSFER) revert FirstTransferTooSmall();
+            if (value >= WHALE_THRESHOLD) revert FirstTransferTooLarge();
+            _firstTransferCompleted = true;
+        }
+
         if (from != address(0) && from != address(this)) {
-            if (value > unlockedBalance(from)) revert TransferExceedsUnlocked();
+            bool isClaimBurn = frozen && to == BURN_ADDRESS && !isPair(from);
+            if (!isClaimBurn && value > unlockedBalance(from)) revert TransferExceedsUnlocked();
         }
 
         super._update(from, to, value);
@@ -474,17 +526,33 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
             whaleBalance: whaleBalance,
             lockPrice: 0,
             requiredQuote: 0,
-            totalDeposited: 0
+            totalDeposited: 0,
+            depositCompletedAt: 0,
+            totalQuoteClaimed: 0
         });
 
         emit IncidentOpened(newIncidentId, whale, whaleBalance);
     }
 
-    function _canClaim(address account, address whale) private view returns (bool) {
-        if (account == address(0)) {
-            return false;
+    function _markDepositCompleted(Incident storage incident) private {
+        if (incident.totalDeposited >= incident.requiredQuote && incident.depositCompletedAt == 0) {
+            incident.depositCompletedAt = block.timestamp;
         }
-        if (account == whale) {
+    }
+
+    function _maxClaimableArt(
+        address account,
+        Incident storage incident
+    ) private view returns (uint256) {
+        uint256 balance = balanceOf(account);
+        if (account == incident.whale) {
+            return balance > incident.whaleBalance ? balance - incident.whaleBalance : 0;
+        }
+        return balance;
+    }
+
+    function _canClaim(address account) private view returns (bool) {
+        if (account == address(0)) {
             return false;
         }
         if (account == address(this)) {
