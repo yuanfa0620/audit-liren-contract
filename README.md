@@ -768,16 +768,3 @@ ERC20 标准 `Transfer`、`Approval` 事件同样适用。
 9. **Pair 持仓不触发巨鲸检测**：流动性在已注册 Pair 中不计入单地址 67% 判定；巨鲸冻结后从 LP 撤池返还的 LIREN 可 claim（上限为 `balanceOf(whale) - whaleBalance`），避免代币永久锁死。
 10. **quote 注入不受 LIREN 冻结影响**：`depositQuote` 发生在 quote token 合约上，不受 LIREN `TransferFrozen` 拦截。
 11. **未注册 Pair 无法撤池**：仅 `_pairs` 列表内的 Pair 会在冻结时重同步 checkpoint；冻结前未 `setPair` 的池子无法在冻结期正确放行撤池。
-
----
-
-## 附录：相关文件
-
-| 文件 | 说明 |
-|------|------|
-| [`contracts/LIRENToken.sol`](../contracts/LIRENToken.sol) | 主合约源码 |
-| [`contracts/LIRENToken.t.sol`](../contracts/LIRENToken.t.sol) | Foundry 测试 |
-| [`ignition/modules/LIRENTokenOnly.ts`](../ignition/modules/LIRENTokenOnly.ts) | Ignition 部署模块 |
-| [`ignition/parameters/bsc-testnet-lirentoken.json`](../ignition/parameters/bsc-testnet-lirentoken.json) | BSC 测试网部署参数 |
-| [`docs/Deploy-BSC-Testnet-LIRENToken.md`](Deploy-BSC-Testnet-LIRENToken.md) | 测试网部署与建池指南 |
-| [`scripts/create-lirentoken-pair.ts`](../scripts/create-lirentoken-pair.ts) | V2 建池 + `setPair` 脚本 |
