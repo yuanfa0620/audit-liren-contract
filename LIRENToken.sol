@@ -6,6 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IUniswapV2Pair} from "./interfaces/IUniswapV2Pair.sol";
 
 /// @dev PancakeSwap V2 pair-only LIREN token (no V3 / NPM helper).
 contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
@@ -15,6 +16,9 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
     uint256 public constant WHALE_THRESHOLD = 670_000_000 * 10 ** 18;
     uint256 public constant MIN_FIRST_TRANSFER = TOTAL_SUPPLY * 33 / 100;
     uint256 public constant PRICE_PRECISION = 1e18;
+    uint256 private constant SECONDS_PER_DAY = 1 days;
+    uint256 private constant MAX_PRICE_DAYS = 30;
+    uint256 public constant QUOTE_SWEEP_DELAY = 365 days;
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     struct VestingSchedule {
@@ -42,12 +46,10 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         uint256 totalQuoteClaimed;
     }
 
-    bool public frozen;
     bool public frozenPermanent;
-    bool public whaleCheckEnabled;
+    bool public constant whaleCheckEnabled = true;
     address public lastWhale;
     address public quoteSweeper;
-    uint256 public quoteSweepDelay;
 
     IERC20 public immutable quoteToken;
 
@@ -61,11 +63,13 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
     mapping(address => VestingSchedule[]) private _vestingSchedules;
     mapping(uint256 => Incident) public incidents;
     mapping(uint256 => mapping(address => uint256)) public claimedArt;
+    mapping(uint256 => uint256) private _dailyPrices;
+    mapping(uint256 => bool) private _dailyPriceRecorded;
+    mapping(uint256 => bool) private _dailyPriceFromTrade;
 
     ArtworkInfo private _artworkInfo;
 
     event FrozenTriggered(address indexed account, uint256 balance);
-    event WhaleCheckEnabled(address indexed admin);
     event PairUpdated(address indexed pair, bool enabled);
     event LockScheduleCreated(
         address indexed beneficiary,
@@ -83,6 +87,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         uint256 artAmount,
         uint256 quoteAmount
     );
+    event DailyPriceRecorded(uint256 indexed dayIndex, address indexed pair, uint256 price);
     event QuoteSweeperUpdated(address indexed sweeper);
     event RemainingQuoteSwept(uint256 indexed incidentId, address indexed to, uint256 amount);
 
@@ -106,6 +111,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
     error FirstTransferTooSmall();
     error FirstTransferTooLarge();
     error UnauthorizedSweeper();
+    error InvalidSweeper();
     error SweepTooEarly();
     error InvalidRecipient();
     error NothingToSweep();
@@ -129,7 +135,6 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         if (address(quoteToken_) == address(0)) revert InvalidQuoteToken();
         quoteToken = quoteToken_;
         _mint(initialOwner_, TOTAL_SUPPLY);
-        whaleCheckEnabled = true;
     }
 
     function getArtworkInfo()
@@ -153,7 +158,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         );
     }
 
-    function setPair(address pair, bool enabled, uint256 quoteSweepDelay_) external onlyOwner {
+    function setPair(address pair, bool enabled) external onlyOwner {
         if (frozenPermanent) revert FrozenConfigLocked();
 
         bool wasEnabled = _pairsEnabled[pair];
@@ -166,15 +171,17 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
             }
             _syncV2LpCheckpoint(pair);
         } else {
+            if (wasEnabled) {
+                _removePair(pair);
+            }
             _pairsEnabled[pair] = false;
         }
-
-        quoteSweepDelay = quoteSweepDelay_;
 
         emit PairUpdated(pair, enabled);
     }
 
     function setQuoteSweeper(address sweeper_) external onlyOwner {
+        if (sweeper_ == address(0)) revert InvalidSweeper();
         quoteSweeper = sweeper_;
         emit QuoteSweeperUpdated(sweeper_);
     }
@@ -187,8 +194,12 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         return _lpSupplyCheckpoint[pair];
     }
 
+    function frozen() external view returns (bool) {
+        return frozenPermanent;
+    }
+
     function areSwapsBlocked() external view returns (bool) {
-        return frozen;
+        return frozenPermanent;
     }
 
     function pairsCount() external view returns (uint256) {
@@ -199,25 +210,26 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         return _pairs[index];
     }
 
-    function enableWhaleCheck() external onlyOwner {
-        if (frozenPermanent) revert FrozenConfigLocked();
-        whaleCheckEnabled = true;
-        emit WhaleCheckEnabled(msg.sender);
+    function dailyPrice(uint256 dayIndex) external view returns (uint256) {
+        return _dailyPrices[dayIndex];
     }
 
-    function setLockPrice(uint256 incidentId_, uint256 lockPrice_) external onlyOwner {
-        Incident storage incident = incidents[incidentId_];
-        if (incident.whale == address(0)) revert InvalidIncident();
-        if (incident.lockPrice != 0) revert PriceAlreadySet();
-        if (lockPrice_ == 0) revert PriceNotSet();
+    function isDailyPriceRecorded(uint256 dayIndex) external view returns (bool) {
+        return _dailyPriceRecorded[dayIndex];
+    }
 
-        uint256 nonWhaleArt = TOTAL_SUPPLY - incident.whaleBalance;
-        uint256 required = (lockPrice_ * nonWhaleArt) / PRICE_PRECISION;
+    function isDailyPriceFromTrade(uint256 dayIndex) external view returns (bool) {
+        return _dailyPriceFromTrade[dayIndex];
+    }
 
-        incident.lockPrice = lockPrice_;
-        incident.requiredQuote = required;
+    function previewLockPrice() external view returns (uint256) {
+        uint256 averagePrice = _getAveragePrice();
+        return averagePrice == 0 ? _spotPriceFromRegisteredPair() : averagePrice;
+    }
 
-        emit LockPriceSet(incidentId_, lockPrice_, required);
+    function recordDailyPrice(address pair) external {
+        if (frozenPermanent || !isPair(pair)) revert PriceNotSet();
+        _maybeRecordDailyPriceManual(pair);
     }
 
     function depositQuote(uint256 incidentId_, uint256 amount) external nonReentrant {
@@ -315,7 +327,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         Incident storage incident = incidents[incidentId_];
         if (incident.whale == address(0)) revert InvalidIncident();
         if (incident.depositCompletedAt == 0) revert NotClaimable();
-        if (block.timestamp < incident.depositCompletedAt + quoteSweepDelay) revert SweepTooEarly();
+        if (block.timestamp < incident.depositCompletedAt + QUOTE_SWEEP_DELAY) revert SweepTooEarly();
 
         uint256 vaultBalance = quoteToken.balanceOf(address(this));
         uint256 earmarked = incident.totalDeposited - incident.totalQuoteClaimed;
@@ -429,7 +441,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
     }
 
     function _update(address from, address to, uint256 value) internal override {
-        if (frozen) {
+        if (frozenPermanent) {
             if (!_isAllowedFrozenTransfer(from, to)) {
                 revert TransferFrozen();
             }
@@ -442,7 +454,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         }
 
         if (from != address(0) && from != address(this)) {
-            bool isClaimBurn = frozen && to == BURN_ADDRESS && !isPair(from);
+            bool isClaimBurn = frozenPermanent && to == BURN_ADDRESS && !isPair(from);
             if (!isClaimBurn && value > unlockedBalance(from)) revert TransferExceedsUnlocked();
         }
 
@@ -450,9 +462,15 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
 
         if (_pairsEnabled[from]) {
             _syncV2LpCheckpoint(from);
+            if (!frozenPermanent) {
+                _recordDailyPriceFromTrade(from);
+            }
         }
         if (_pairsEnabled[to]) {
             _syncV2LpCheckpoint(to);
+            if (!frozenPermanent) {
+                _recordDailyPriceFromTrade(to);
+            }
         }
 
         if (whaleCheckEnabled && from != address(0)) {
@@ -478,15 +496,112 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         return _isRemoveLiquidityV2(from);
     }
 
-    /// @dev LP burn in the same tx lowers pair LP totalSupply below the checkpoint.
+    /// @dev During freeze, swap does not change LP supply while burn() does (with optional
+    /// protocol fee mint). When fee mint equals user burn, LP supply is unchanged and
+    /// reserve/balance comparison distinguishes swap input from remove liquidity.
     function _isRemoveLiquidityV2(address pair) private view returns (bool) {
-        uint256 checkpoint = _lpSupplyCheckpoint[pair];
-        uint256 currentSupply = IERC20(pair).totalSupply();
-        return currentSupply < checkpoint;
+        if (IERC20(pair).totalSupply() != _lpSupplyCheckpoint[pair]) {
+            return true;
+        }
+
+        return !_hasPendingSwapInput(pair);
+    }
+
+    /// @dev Swap sends input token to the pair before outbound transfer; burn does not.
+    function _hasPendingSwapInput(address pair) private view returns (bool) {
+        IUniswapV2Pair v2Pair = IUniswapV2Pair(pair);
+        (uint112 reserve0, uint112 reserve1,) = v2Pair.getReserves();
+
+        return IERC20(v2Pair.token0()).balanceOf(pair) > reserve0
+            || IERC20(v2Pair.token1()).balanceOf(pair) > reserve1;
+    }
+
+    function _removePair(address pair) private {
+        uint256 length = _pairs.length;
+        for (uint256 i = 0; i < length; i++) {
+            if (_pairs[i] == pair) {
+                _pairs[i] = _pairs[length - 1];
+                _pairs.pop();
+                return;
+            }
+        }
     }
 
     function _syncV2LpCheckpoint(address pair) private {
         _lpSupplyCheckpoint[pair] = IERC20(pair).totalSupply();
+    }
+
+    function _priceFromPair(address pair) private view returns (uint256) {
+        IUniswapV2Pair v2Pair = IUniswapV2Pair(pair);
+        (uint112 reserve0, uint112 reserve1,) = v2Pair.getReserves();
+        if (reserve0 == 0 || reserve1 == 0) {
+            return 0;
+        }
+
+        if (v2Pair.token0() == address(this)) {
+            return (uint256(reserve1) * PRICE_PRECISION) / uint256(reserve0);
+        }
+        return (uint256(reserve0) * PRICE_PRECISION) / uint256(reserve1);
+    }
+
+    function _writeDailyPrice(address pair, bool fromTrade) private {
+        uint256 price = _priceFromPair(pair);
+        if (price == 0) {
+            return;
+        }
+
+        uint256 dayIndex = block.timestamp / SECONDS_PER_DAY;
+        _dailyPrices[dayIndex] = price;
+        _dailyPriceRecorded[dayIndex] = true;
+        _dailyPriceFromTrade[dayIndex] = fromTrade;
+
+        emit DailyPriceRecorded(dayIndex, pair, price);
+    }
+
+    function _recordDailyPriceFromTrade(address pair) private {
+        uint256 dayIndex = block.timestamp / SECONDS_PER_DAY;
+        if (_dailyPriceFromTrade[dayIndex]) {
+            return;
+        }
+
+        _writeDailyPrice(pair, true);
+    }
+
+    function _maybeRecordDailyPriceManual(address pair) private {
+        uint256 dayIndex = block.timestamp / SECONDS_PER_DAY;
+        if (_dailyPriceRecorded[dayIndex]) {
+            return;
+        }
+
+        _writeDailyPrice(pair, false);
+    }
+
+    function _getAveragePrice() private view returns (uint256) {
+        uint256 today = block.timestamp / SECONDS_PER_DAY;
+        uint256 sum;
+        uint256 count;
+
+        for (uint256 i = 1; i <= MAX_PRICE_DAYS && i <= today; i++) {
+            uint256 dayIndex = today - i;
+            if (!_dailyPriceRecorded[dayIndex]) {
+                continue;
+            }
+            sum += _dailyPrices[dayIndex];
+            count++;
+        }
+
+        return count == 0 ? 0 : sum / count;
+    }
+
+    function _spotPriceFromRegisteredPair() private view returns (uint256) {
+        uint256 length = _pairs.length;
+        for (uint256 i = 0; i < length; i++) {
+            uint256 price = _priceFromPair(_pairs[i]);
+            if (price != 0) {
+                return price;
+            }
+        }
+        return 0;
     }
 
     function _resyncAllPairCheckpoints() private {
@@ -506,8 +621,7 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
 
         uint256 balance = balanceOf(account);
         if (balance >= WHALE_THRESHOLD) {
-            if (!frozen) {
-                frozen = true;
+            if (!frozenPermanent) {
                 frozenPermanent = true;
                 lastWhale = account;
                 _resyncAllPairCheckpoints();
@@ -521,17 +635,25 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         if (whale == address(0)) revert InvalidIncident();
 
         uint256 newIncidentId = ++incidentId;
+        uint256 lockPrice = _getAveragePrice();
+        if (lockPrice == 0) {
+            lockPrice = _spotPriceFromRegisteredPair();
+        }
+        if (lockPrice == 0) revert PriceNotSet();
+
+        uint256 requiredQuoteAmount = (lockPrice * (TOTAL_SUPPLY - whaleBalance)) / PRICE_PRECISION;
         incidents[newIncidentId] = Incident({
             whale: whale,
             whaleBalance: whaleBalance,
-            lockPrice: 0,
-            requiredQuote: 0,
+            lockPrice: lockPrice,
+            requiredQuote: requiredQuoteAmount,
             totalDeposited: 0,
             depositCompletedAt: 0,
             totalQuoteClaimed: 0
         });
 
         emit IncidentOpened(newIncidentId, whale, whaleBalance);
+        emit LockPriceSet(newIncidentId, lockPrice, requiredQuoteAmount);
     }
 
     function _markDepositCompleted(Incident storage incident) private {
