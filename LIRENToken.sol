@@ -496,24 +496,13 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         return _isRemoveLiquidityV2(from);
     }
 
-    /// @dev During freeze, swap does not change LP supply while burn() does (with optional
-    /// protocol fee mint). When fee mint equals user burn, LP supply is unchanged and
-    /// reserve/balance comparison distinguishes swap input from remove liquidity.
+    /// @dev During freeze, only treat Pair→user as removeLiquidity when LP totalSupply
+    /// differs from the checkpoint. burn() changes supply (fee mint and/or user burn);
+    /// swap (including flash/callback optimistic transfer) leaves supply unchanged.
+    /// When fee mint exactly equals user burn, supply is unchanged and remove is blocked
+    /// to avoid allowing flash buys that also have balance==reserve at transfer time.
     function _isRemoveLiquidityV2(address pair) private view returns (bool) {
-        if (IERC20(pair).totalSupply() != _lpSupplyCheckpoint[pair]) {
-            return true;
-        }
-
-        return !_hasPendingSwapInput(pair);
-    }
-
-    /// @dev Swap sends input token to the pair before outbound transfer; burn does not.
-    function _hasPendingSwapInput(address pair) private view returns (bool) {
-        IUniswapV2Pair v2Pair = IUniswapV2Pair(pair);
-        (uint112 reserve0, uint112 reserve1,) = v2Pair.getReserves();
-
-        return IERC20(v2Pair.token0()).balanceOf(pair) > reserve0
-            || IERC20(v2Pair.token1()).balanceOf(pair) > reserve1;
+        return IERC20(pair).totalSupply() != _lpSupplyCheckpoint[pair];
     }
 
     function _removePair(address pair) private {
