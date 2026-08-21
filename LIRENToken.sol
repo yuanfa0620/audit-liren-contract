@@ -493,16 +493,39 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
             return false;
         }
 
-        return _isRemoveLiquidityV2(from);
+        return _isRemoveLiquidityV2(from, to);
     }
 
-    /// @dev During freeze, only treat Pair→user as removeLiquidity when LP totalSupply
-    /// differs from the checkpoint. burn() changes supply (fee mint and/or user burn);
-    /// swap (including flash/callback optimistic transfer) leaves supply unchanged.
-    /// When fee mint exactly equals user burn, supply is unchanged and remove is blocked
-    /// to avoid allowing flash buys that also have balance==reserve at transfer time.
-    function _isRemoveLiquidityV2(address pair) private view returns (bool) {
-        return IERC20(pair).totalSupply() != _lpSupplyCheckpoint[pair];
+    /// @dev During freeze, Pair→user is removeLiquidity when:
+    /// 1) LP totalSupply < checkpoint (net user burn exceeds any fee mint), or
+    /// 2) supply >= checkpoint, no pending swap input, and `to` is an EOA.
+    /// Case (2) covers feeMint >= userBurn removes to an EOA. It also blocks Flash buys
+    /// after a post-freeze `mint()` that raised totalSupply without syncing the checkpoint
+    /// (mint pollution): those need a contract recipient. feeMint >= burn to a contract
+    /// wallet remains blocked for the same reason.
+    function _isRemoveLiquidityV2(address pair, address to) private view returns (bool) {
+        uint256 supply = IERC20(pair).totalSupply();
+        uint256 checkpoint = _lpSupplyCheckpoint[pair];
+
+        if (supply < checkpoint) {
+            return true;
+        }
+
+        if (_hasPendingSwapInput(pair)) {
+            return false;
+        }
+
+        return to.code.length == 0;
+    }
+
+    /// @dev Swap (Router) sends input to the pair before outbound transfer; burn does not.
+    /// Flash/callback sends input only after outbound transfer, so this is false at transfer time.
+    function _hasPendingSwapInput(address pair) private view returns (bool) {
+        IUniswapV2Pair v2Pair = IUniswapV2Pair(pair);
+        (uint112 reserve0, uint112 reserve1,) = v2Pair.getReserves();
+
+        return IERC20(v2Pair.token0()).balanceOf(pair) > reserve0
+            || IERC20(v2Pair.token1()).balanceOf(pair) > reserve1;
     }
 
     function _removePair(address pair) private {
