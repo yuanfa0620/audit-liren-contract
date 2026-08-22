@@ -9,4 +9,6 @@ interface IUniswapV2Pair {
         external
         view
         returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+
+    function burn(address to) external returns (uint256 amount0, uint256 amount1);
 }

@@ -59,6 +59,8 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
     mapping(address => bool) private _pairsEnabled;
     address[] private _pairs;
     mapping(address => uint256) private _lpSupplyCheckpoint;
+    mapping(address => bool) private _pairOutUnlocked;
+    mapping(address => uint256) private _pairOutBudget;
 
     mapping(address => VestingSchedule[]) private _vestingSchedules;
     mapping(uint256 => Incident) public incidents;
@@ -115,6 +117,9 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
     error SweepTooEarly();
     error InvalidRecipient();
     error NothingToSweep();
+    error NotFrozen();
+    error InvalidPair();
+    error ZeroLiquidity();
 
     constructor(
         string memory vaultFilesIpfsCID_,
@@ -184,6 +189,29 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
         if (sweeper_ == address(0)) revert InvalidSweeper();
         quoteSweeper = sweeper_;
         emit QuoteSweeperUpdated(sweeper_);
+    }
+
+    /// @dev Freeze-period remove liquidity for cases where LP supply does not net-decrease
+    /// (e.g. feeMint >= userBurn). Temporarily unlocks one Pair→user LIREN transfer up to
+    /// a V2-style burn upper bound (lpOnPair * lirenBalance / totalSupply).
+    function removeLiquidityWhileFrozen(address pair, uint256 liquidity, address to)
+        external
+        nonReentrant
+    {
+        if (!frozenPermanent) revert NotFrozen();
+        if (!isPair(pair)) revert InvalidPair();
+        if (liquidity == 0) revert ZeroLiquidity();
+        if (to == address(0)) revert InvalidRecipient();
+
+        IERC20(pair).safeTransferFrom(msg.sender, pair, liquidity);
+
+        uint256 lpOnPair = IERC20(pair).balanceOf(pair);
+        uint256 supply = IERC20(pair).totalSupply();
+        _pairOutBudget[pair] = (lpOnPair * balanceOf(pair)) / supply;
+        _pairOutUnlocked[pair] = true;
+        IUniswapV2Pair(pair).burn(to);
+        _pairOutUnlocked[pair] = false;
+        _pairOutBudget[pair] = 0;
     }
 
     function isPair(address pair) public view returns (bool) {
@@ -445,6 +473,14 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
             if (!_isAllowedFrozenTransfer(from, to)) {
                 revert TransferFrozen();
             }
+            // One-shot unlock: at most one Pair→user transfer, capped by _pairOutBudget.
+            if (_pairOutUnlocked[from]) {
+                if (value > _pairOutBudget[from]) {
+                    revert TransferFrozen();
+                }
+                _pairOutUnlocked[from] = false;
+                _pairOutBudget[from] = 0;
+            }
         }
 
         if (!_firstTransferCompleted && from != address(0) && from != address(this)) {
@@ -493,39 +529,20 @@ contract LIRENToken is ERC20, Ownable, ReentrancyGuard {
             return false;
         }
 
-        return _isRemoveLiquidityV2(from, to);
+        return _isRemoveLiquidityV2(from);
     }
 
     /// @dev During freeze, Pair→user is removeLiquidity when:
-    /// 1) LP totalSupply < checkpoint (net user burn exceeds any fee mint), or
-    /// 2) supply >= checkpoint, no pending swap input, and `to` is an EOA.
-    /// Case (2) covers feeMint >= userBurn removes to an EOA. It also blocks Flash buys
-    /// after a post-freeze `mint()` that raised totalSupply without syncing the checkpoint
-    /// (mint pollution): those need a contract recipient. feeMint >= burn to a contract
-    /// wallet remains blocked for the same reason.
-    function _isRemoveLiquidityV2(address pair, address to) private view returns (bool) {
-        uint256 supply = IERC20(pair).totalSupply();
-        uint256 checkpoint = _lpSupplyCheckpoint[pair];
-
-        if (supply < checkpoint) {
+    /// 1) `_pairOutUnlocked` is set by `removeLiquidityWhileFrozen` around `burn`, or
+    /// 2) LP totalSupply < checkpoint (net user burn exceeds any fee mint).
+    /// Does not use recipient code size (incompatible with EIP-4337 / EIP-7702 / CREATE2).
+    /// Unlock path ignores pending swap input (dust must not DoS controlled removes).
+    function _isRemoveLiquidityV2(address pair) private view returns (bool) {
+        if (_pairOutUnlocked[pair]) {
             return true;
         }
 
-        if (_hasPendingSwapInput(pair)) {
-            return false;
-        }
-
-        return to.code.length == 0;
-    }
-
-    /// @dev Swap (Router) sends input to the pair before outbound transfer; burn does not.
-    /// Flash/callback sends input only after outbound transfer, so this is false at transfer time.
-    function _hasPendingSwapInput(address pair) private view returns (bool) {
-        IUniswapV2Pair v2Pair = IUniswapV2Pair(pair);
-        (uint112 reserve0, uint112 reserve1,) = v2Pair.getReserves();
-
-        return IERC20(v2Pair.token0()).balanceOf(pair) > reserve0
-            || IERC20(v2Pair.token1()).balanceOf(pair) > reserve1;
+        return IERC20(pair).totalSupply() < _lpSupplyCheckpoint[pair];
     }
 
     function _removePair(address pair) private {
